@@ -1,0 +1,2589 @@
+// ==UserScript==
+// @name         DC-Radar (V8.3.0 Master-Slave)
+// @namespace    http://tampermonkey.net/
+// @version      8.3.0
+// @description  탭 간 통신을 통해 단 하나의 탭만 스캔을 수행하며, 마지막 활성 갤러리를 영구 기억합니다.
+// @author       User (Integrated by Gemini)
+// @match        https://gall.dcinside.com/*
+// @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const CONFIG = {
+        KEYWORD_KEY: 'dc_radar_keywords_v8',
+        CACHE_KEY: 'dc_radar_found_cache_v8',
+        GLOBAL_ACTIVE_GALLERY: 'dc_radar_active_id',
+        LEADER_KEY: 'dc_radar_leader_tab',
+        SETTINGS_KEY: 'dc_radar_settings_v9',
+        GLOBAL_SETTINGS_KEY: 'dc_radar_global_settings_v1',
+        INTERVAL: 5000,
+        HEARTBEAT_INTERVAL: 4000,
+        LEADER_TTL: 60000,
+        SKIP_NOTICE: true,
+        SKIP_SUBJECTS_KEY: 'dc_radar_skip_subjects_v8',
+        REQUEST_TIMEOUT: 8000,
+        REQUEST_DELAY: 180,
+        REQUEST_JITTER: 120,
+        MAX_CONCURRENCY: 3,
+        BACKOFF_BASE: 1200,
+        BACKOFF_MAX: 8000,
+        DEBUG: false,
+    };
+
+    const TAB_ID = Math.random().toString(36).substr(2, 9);
+
+    function normalizeGalleryId(value) {
+        return String(value || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[^\w-]/g, '');
+    }
+
+    function getGalleryId() {
+        const paramsId = new URLSearchParams(window.location.search).get('id');
+        if (paramsId) return normalizeGalleryId(paramsId);
+        const path = window.location.pathname;
+        const miniMatch = path.match(/\/mini\/(?:board\/)?([^/]+)/);
+        if (miniMatch) return normalizeGalleryId(miniMatch[1]);
+        const minorMatch = path.match(/\/minor\/(?:board\/)?([^/]+)/);
+        if (minorMatch) return normalizeGalleryId(minorMatch[1]);
+        const boardMatch = path.match(/\/board\/(\w+)/);
+        if (boardMatch) return normalizeGalleryId(boardMatch[1]);
+        const mgalleryMatch = path.match(/\/mgallery\/(?:board\/)?(\w+)/);
+        if (mgalleryMatch) return normalizeGalleryId(mgalleryMatch[1]);
+        const parts = path.split('/').filter(Boolean).map(segment => normalizeGalleryId(segment)).filter(Boolean);
+        return parts[parts.length - 1] || 'unknown';
+    }
+
+    const CURRENT_GALL_ID = getGalleryId();
+
+    let memoizedCache = null;
+    let memoizedRules = null;
+    let radarInterval = null;
+    let heartbeatTimer = null;
+    let restoreScheduled = false;
+    let keywordData = null;
+    let renderChipsFn = null;
+    let skipSubjects = [];
+    let settingsStore = null;
+    let subjectCollectScheduled = false;
+    const VIEW_BANNER_ID = 'dc-radar-view-banner';
+    let viewRetryTimer = null;
+    let viewRetryCount = 0;
+    const VIEW_RETRY_INTERVAL = 50;
+    const VIEW_RETRY_LIMIT = 40;
+
+    let allowedHeadersEnabled = false;
+    let allowedHeaders = [];
+    let isScanning = false;
+    let backoffUntil = 0;
+    let scanMetrics = { runs: 0, failures: 0 };
+    let lastWasViewPage = false;
+    let allowViewScan = false;
+    let globalSettings = null;
+
+    function debugLog(message) {
+        if (!CONFIG.DEBUG) return;
+        console.log(`[DC-Radar][DEBUG] ${message}`);
+    }
+
+    function buildListUrl(galleryId) {
+        const base = window.location.origin;
+        const normalized = normalizeGalleryId(galleryId);
+        if (!normalized) return window.location.href.split('?')[0] + window.location.search;
+        if (window.location.pathname.includes('/mini/')) {
+            return `${base}/mini/board/lists?id=${normalized}`;
+        }
+        if (window.location.pathname.includes('/minor/')) {
+            return `${base}/minor/board/lists?id=${normalized}`;
+        }
+        if (window.location.pathname.includes('/mgallery/')) {
+            return `${base}/mgallery/board/lists?id=${normalized}`;
+        }
+        return `${base}/board/lists?id=${normalized}`;
+    }
+
+    function getListRows(doc) {
+        const selectors = [
+            '.gall_list .ub-content',
+            '.gall_list tbody tr.ub-content',
+            '.listwrap .ub-content',
+            '.list_box .ub-content',
+            'table.gall_list tr.ub-content',
+            'tr.ub-content',
+            'tbody tr',
+        ];
+        for (const selector of selectors) {
+            const rows = doc.querySelectorAll(selector);
+            if (rows.length > 0) return rows;
+        }
+        return doc.querySelectorAll('.ub-content');
+    }
+
+    const STYLE = `
+:root {
+  --dc-radar-z: 999999;
+  --dc-radar-btn-offset: -4px;
+}
+.dc-radar-container{ transform:translateY(var(--dc-radar-btn-offset)); }
+.dc-radar-container .dc-radar-icon-btn{
+  width:26px;
+  height:26px;
+  box-shadow:none;
+  background:transparent;
+}
+.dc-radar-icon-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:28px;
+  height:28px;
+  margin-left:8px;
+  cursor:pointer;
+  border-radius:8px;
+  position:relative;
+  vertical-align:middle;
+  background:#fff;
+  border:1px solid rgba(0,0,0,.10);
+  box-shadow:0 1px 2px rgba(0,0,0,.06);
+  user-select:none;
+}
+.dc-radar-icon-btn:hover{ box-shadow:0 4px 14px rgba(0,0,0,.10); transform:translateY(-1px); }
+.dc-radar-icon-btn:active{ transform:translateY(0); box-shadow:0 2px 8px rgba(0,0,0,.10); }
+
+.dc-radar-bell{
+  font-size:16px;
+  line-height:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  width:100%;
+  height:100%;
+}
+
+.dc-radar-status-dot{
+  position:absolute;
+  top:4px;
+  right:4px;
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:#abb2bf;
+  transition:transform .15s, box-shadow .15s, background-color .15s;
+  cursor:pointer;
+  border:1px solid #fff;
+  box-shadow:0 0 0 1px rgba(0,0,0,.08);
+}
+.dc-radar-status-dot.active{ background:#2ecc71; box-shadow:0 0 0 1px rgba(0,0,0,.08), 0 0 6px rgba(46,204,113,.7); }
+.dc-radar-status-dot.master{ background:#007bff; box-shadow:0 0 0 1px rgba(0,0,0,.08), 0 0 6px rgba(0,123,255,.7); }
+
+.dc-radar-overlay{
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,.45);
+  z-index:var(--dc-radar-z);
+  display:none;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+}
+.dc-radar-overlay.show{ display:flex; }
+
+.dc-radar-modal{
+  width:560px;
+  max-width:92vw;
+  max-height:680px;
+  height:72vh;
+  background:#fff;
+  border-radius:14px;
+  box-shadow:0 20px 60px rgba(0,0,0,.35);
+  border:1px solid rgba(0,0,0,.08);
+  font-family:'Malgun Gothic', sans-serif;
+  display:flex;
+  flex-direction:column;
+}
+
+.dc-radar-modal-header{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  padding:14px 16px;
+  border-bottom:1px solid rgba(0,0,0,.08);
+}
+.dc-radar-modal-header-top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.dc-radar-modal-title{
+  font-weight:800;
+  font-size:16px;
+  color:#222;
+}
+.dc-radar-modal-close{
+  width:30px;
+  height:30px;
+  border-radius:8px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  cursor:pointer;
+  background:rgba(0,0,0,.06);
+  color:#555;
+}
+.dc-radar-status-pills{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.dc-radar-pill{
+  padding:4px 10px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:800;
+  background:#f1f3f5;
+  color:#444;
+  border:1px solid rgba(0,0,0,.08);
+}
+.dc-radar-pill.master{ background:#e7f1ff; color:#0b5ed7; border-color:#9ec5fe; }
+.dc-radar-pill.slave{ background:#e6fcf5; color:#0ca678; border-color:#96f2d7; }
+.dc-radar-pill.off{ background:#f8f9fa; color:#868e96; }
+.dc-radar-pill.on{ background:#fff4e6; color:#d9480f; border-color:#ffc078; }
+
+.dc-radar-modal-body{
+  padding:14px 16px 4px;
+  overflow:auto;
+}
+
+.dc-radar-tabs{
+  display:flex;
+  gap:8px;
+  margin-bottom:12px;
+  flex-wrap:wrap;
+}
+.dc-radar-tab{
+  padding:8px 12px;
+  border-radius:8px;
+  border:1px solid rgba(0,0,0,.12);
+  cursor:pointer;
+  font-weight:700;
+  font-size:13px;
+  background:#f8f9fa;
+}
+.dc-radar-tab.active{ background:#e7f1ff; border-color:#9ec5fe; color:#0b5ed7; }
+
+.dc-radar-section{ display:none; }
+.dc-radar-section.active{ display:block; }
+
+.dc-radar-section-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:6px;
+}
+.dc-radar-section-header button{
+  background:none;
+  border:none;
+  cursor:pointer;
+  font-weight:800;
+  font-size:12px;
+  color:#495057;
+}
+
+.dc-radar-row{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  margin-bottom:8px;
+}
+.dc-radar-row input[type="text"],
+.dc-radar-row input[type="search"]{
+  flex:1;
+  padding:8px 10px;
+  border:1px solid rgba(0,0,0,.14);
+  border-radius:8px;
+  font-size:13px;
+}
+.dc-radar-row label{
+  font-size:12px;
+  font-weight:700;
+  color:#343a40;
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.dc-radar-row button{
+  padding:8px 10px;
+  border:none;
+  border-radius:8px;
+  cursor:pointer;
+  font-weight:800;
+  font-size:12px;
+  background:#343a40;
+  color:#fff;
+}
+
+.dc-radar-chips{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-bottom:10px;
+}
+.dc-radar-chip{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:6px 8px;
+  border-radius:999px;
+  background:#f1f3f5;
+  border:1px solid rgba(0,0,0,.08);
+  font-size:12px;
+  cursor:pointer;
+}
+.dc-radar-chip.disabled{ opacity:.5; text-decoration:line-through; }
+.dc-radar-chip .dc-radar-chip-close{
+  background:#fff;
+  border-radius:50%;
+  width:16px;
+  height:16px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:11px;
+  border:1px solid rgba(0,0,0,.1);
+}
+
+.dc-radar-help{
+  font-size:12px;
+  color:#666;
+  background:#f8f9fa;
+  border:1px solid rgba(0,0,0,.06);
+  padding:10px;
+  border-radius:10px;
+  margin-bottom:10px;
+  line-height:1.4;
+}
+
+.dc-radar-transfer textarea{
+  width:100%;
+  min-height:120px;
+  padding:10px;
+  border:1px solid rgba(0,0,0,.14);
+  border-radius:10px;
+  font-size:12px;
+  resize:vertical;
+}
+.dc-radar-transfer .dc-radar-row{ margin-top:8px; }
+.dc-radar-error{
+  color:#e03131;
+  font-size:12px;
+  margin-top:6px;
+}
+
+.dc-radar-modal-footer{
+  display:flex;
+  gap:8px;
+  padding:12px 16px 16px;
+}
+.dc-radar-footer-btn{
+  flex:1;
+  padding:10px 12px;
+  border:none;
+  border-radius:10px;
+  cursor:pointer;
+  font-weight:800;
+  font-size:13px;
+}
+.dc-radar-footer-btn.save{ background:#e03131; color:#fff; }
+.dc-radar-footer-btn.close{ background:#dee2e6; color:#333; }
+.dc-radar-footer-btn.clear{ background:#343a40; color:#fff; }
+
+.dc-radar-collapse{ display:block; }
+.dc-radar-collapse.collapsed{ display:none; }
+.dc-radar-chips-wrapper{ display:block; margin-bottom:10px; }
+.dc-radar-chips-wrapper.collapsed{ display:none; }
+
+tr.dc-radar-detected{ box-shadow: inset 4px 0 0 #c92a2a !important; background-color: rgba(255, 0, 0, 0.045) !important; }
+tr.dc-radar-detected .gall_tit a{ color:#c92a2a !important; font-weight:900 !important; }
+.dc-bell-badge{ display:inline-flex; align-items:center; justify-content:center; height:16px; padding:0 4px; margin-left:6px; font-size:10px; font-weight:bold; color:#d9480f; background-color:#fff9db; border:1px solid rgba(250, 176, 5, 0.8); border-radius:3px; vertical-align:middle; line-height:0; position:relative; top:-1px; }
+.dc-bell-icon{ width:11px; height:11px; margin-right:2px; fill:#fab005 !important; stroke:none !important; }
+
+.dc-radar-view-banner{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:10px 12px;
+  border-radius:10px;
+  border:1px solid rgba(250, 176, 5, 0.6);
+  background:rgba(255, 249, 219, 0.9);
+  color:#5f3b00;
+  font-size:13px;
+  font-weight:700;
+  margin:10px 0;
+}
+
+.dc-radar-preview{
+  margin-top:8px;
+  margin-bottom:12px;
+  padding:10px 12px;
+  border-radius:8px;
+  border:1px solid rgba(0,0,0,.08);
+  background:#f8f9fa;
+  font-size:12px;
+  line-height:1.4;
+  overflow-wrap:anywhere;
+  word-break:break-word;
+}
+.dc-radar-preview-snippet{
+  color:#495057;
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+.dc-radar-highlight{ background:#fff3bf; color:#d9480f; font-weight:700; padding:0 2px; border-radius:4px; }
+
+.dc-radar-whitelist-overlay{
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,.45);
+  z-index:var(--dc-radar-z);
+  display:none;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+}
+.dc-radar-whitelist-overlay.show{ display:flex; }
+.dc-radar-whitelist-modal{
+  width:420px;
+  max-width:90vw;
+  background:#fff;
+  border-radius:14px;
+  border:1px solid rgba(0,0,0,.08);
+  box-shadow:0 20px 60px rgba(0,0,0,.35);
+  padding:14px 16px;
+  font-family:'Malgun Gothic', sans-serif;
+}
+.dc-radar-whitelist-modal textarea{
+  width:100%;
+  min-height:120px;
+  padding:10px;
+  border:1px solid rgba(0,0,0,.14);
+  border-radius:10px;
+  font-size:12px;
+  resize:vertical;
+}
+.dc-radar-whitelist-actions{
+  display:flex;
+  gap:8px;
+  margin-top:10px;
+}
+.dc-radar-whitelist-actions button{
+  flex:1;
+  padding:8px 10px;
+  border:none;
+  border-radius:8px;
+  cursor:pointer;
+  font-weight:800;
+  font-size:12px;
+}
+.dc-radar-highlight{
+  display:inline;
+  line-height:inherit;
+  padding:0;
+  border-radius:0;
+  box-shadow:none;
+  -webkit-box-decoration-break:clone;
+  box-decoration-break:clone;
+}
+`;
+
+    const styleEl = document.createElement('style');
+    styleEl.textContent = STYLE;
+    document.head.appendChild(styleEl);
+
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function fetchWithTimeout(url, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const res = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+            return res;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async function safeFetchHTML(url, timeoutMs) {
+        const res = await fetchWithTimeout(url, timeoutMs);
+        return res.text();
+    }
+
+    function parseNoFromUrl(url) {
+        if (!url) return NaN;
+        try {
+            const parsed = new URL(url, window.location.origin);
+            const noValue = parsed.searchParams.get('no');
+            if (!noValue) return NaN;
+            return parseInt(noValue, 10);
+        } catch {
+            return NaN;
+        }
+    }
+
+    function parseNoFromRow(row) {
+        if (!row || row.classList.contains('notice') || row.classList.contains('ub-notice')) {
+            return NaN;
+        }
+        const rawNo = row.getAttribute('data-no');
+        if (rawNo) {
+            const parsed = parseInt(String(rawNo).replace(/[^\d]/g, ''), 10);
+            if (!isNaN(parsed)) return parsed;
+        }
+        const link = row.querySelector('.gall_tit a:not(.reply_numbox)');
+        const hrefNo = parseNoFromUrl(link?.href);
+        if (!isNaN(hrefNo)) return hrefNo;
+        const noText = row.querySelector('td')?.textContent?.trim() || '';
+        const parsedFallback = parseInt(noText.replace(/[^\d]/g, ''), 10);
+        return parsedFallback;
+    }
+
+    function recordFailure(context) {
+        scanMetrics.failures += 1;
+        const exp = Math.min(4, scanMetrics.failures);
+        const backoff = Math.min(CONFIG.BACKOFF_MAX, CONFIG.BACKOFF_BASE * (2 ** exp));
+        backoffUntil = Date.now() + backoff;
+        debugLog(`failure(${context}) -> backoff ${backoff}ms`);
+    }
+
+    function recordSuccess() {
+        scanMetrics.failures = Math.max(0, scanMetrics.failures - 1);
+        if (scanMetrics.failures === 0) {
+            backoffUntil = 0;
+        }
+    }
+
+    // =================================================================
+    // 🏛️ 시스템 코어: 리더 선출 및 상태 관리
+    // =================================================================
+    const System = {
+        isActiveGall: () => localStorage.getItem(CONFIG.GLOBAL_ACTIVE_GALLERY) === CURRENT_GALL_ID,
+
+        getLeader: () => {
+            try {
+                return JSON.parse(localStorage.getItem(CONFIG.LEADER_KEY) || 'null');
+            } catch {
+                return null;
+            }
+        },
+
+        isMaster: () => {
+            const leader = System.getLeader();
+            return leader && leader.tabId === TAB_ID;
+        },
+
+        isLeaderStale: (leader) => {
+            if (!leader || !leader.ts) return true;
+            return Date.now() - leader.ts > CONFIG.LEADER_TTL;
+        },
+
+        updateLeaderHeartbeat: () => {
+            const leader = System.getLeader();
+            if (!leader || leader.tabId !== TAB_ID) return;
+            localStorage.setItem(CONFIG.LEADER_KEY, JSON.stringify({ tabId: TAB_ID, ts: Date.now() }));
+        },
+
+        updateUI: () => {
+            const dot = document.getElementById('radarStatusDot');
+            if (!dot) return;
+            const active = System.isActiveGall();
+            const isMaster = active && System.isMaster();
+            dot.classList.toggle('active', active && !isMaster);
+            dot.classList.toggle('master', isMaster);
+
+            if (isMaster) {
+                dot.title = '실시간 감시 중 (Master)';
+            } else if (active) {
+                dot.title = '실시간 감시 중 (Slave - 대기)';
+            } else {
+                dot.title = '감시 중지 상태';
+            }
+        },
+
+        electLeader: () => {
+            if (!canLeadNow()) {
+                System.stopScan();
+                System.stopHeartbeat();
+                return;
+            }
+
+            const leader = System.getLeader();
+            const stale = System.isLeaderStale(leader);
+
+            if (!leader || stale) {
+                localStorage.setItem(CONFIG.LEADER_KEY, JSON.stringify({ tabId: TAB_ID, ts: Date.now() }));
+                 System.startHeartbeat();
+            if (canScanNow()) {
+                System.startScan();
+            } else {
+                System.stopScan();
+
+            }
+                return;
+            }
+
+            if (leader.tabId === TAB_ID) {
+               System.startHeartbeat();
+                if (canScanNow()) {
+                    System.startScan();
+                } else {
+                    System.stopScan()
+                }
+            } else {
+                System.stopScan();
+                System.stopHeartbeat();
+            }
+        },
+
+        startScan: () => {
+            if (radarInterval || !canScanNow()) return;
+            console.log(`[DC-Radar] ${TAB_ID} 가 마스터로 승격되었습니다.`);
+            startRadarInternal();
+            triggerImmediateScan('master-start');
+        },
+
+        stopScan: () => {
+            if (radarInterval) {
+                console.log(`[DC-Radar] ${TAB_ID} 스캔 중지 (슬레이브 모드 전환)`);
+                clearInterval(radarInterval);
+                radarInterval = null;
+            }
+        },
+
+        startHeartbeat: () => {
+            if (heartbeatTimer) return;
+            heartbeatTimer = setInterval(() => {
+                if (System.isMaster()) {
+                    System.updateLeaderHeartbeat();
+                }
+            }, CONFIG.HEARTBEAT_INTERVAL);
+        },
+
+        stopHeartbeat: () => {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+    };
+
+    // =================================================================
+    // 💾 데이터 및 로직
+    // =================================================================
+    const DEDUPE_TTL_MS = 86400000;
+    const SAFETY_WINDOW = 15;
+
+    const CacheSystem = {
+        get: () => {
+            if (memoizedCache) return memoizedCache;
+            try {
+                memoizedCache = JSON.parse(localStorage.getItem(CONFIG.CACHE_KEY) || '{}');
+                return memoizedCache;
+            } catch { return {}; }
+        },
+        set: (no, keyword, snippet, authorNick, authorKey) => {
+            const cache = CacheSystem.get();
+            const existing = cache[no];
+            const prev = (existing && typeof existing === 'object') ? existing : null;
+            const nextSnippet = snippet === undefined || snippet === '' ? (prev?.snippet || '') : snippet;
+
+            cache[no] = {
+                keyword,
+                snippet: nextSnippet,
+                authorNick: authorNick || prev?.authorNick || '',
+                authorKey: authorKey || prev?.authorKey || '',
+                source: 'content',
+                matchedAt: Date.now(),
+
+                // ✅ dedupe 보존
+                notifiedAt: prev?.notifiedAt || 0,
+                notifiedKw: prev?.notifiedKw || '',
+            };
+
+            const keys = Object.keys(cache);
+            if (keys.length > 500) delete cache[keys[0]];
+            localStorage.setItem(CONFIG.CACHE_KEY, JSON.stringify(cache));
+            memoizedCache = cache;
+        },
+        clear: () => {
+            localStorage.removeItem(CONFIG.CACHE_KEY);
+            memoizedCache = null;
+        }
+    };
+
+    function canonicalKw(csv) {
+        return String(csv || '')
+            .split(',')
+            .map(item => item.trim().toLowerCase())
+            .filter(Boolean)
+            .sort()
+            .join(',');
+    }
+
+    function shouldNotifyDedup(no, normalizedKw) {
+
+        const cache = CacheSystem.get();
+        const entry = cache?.[no];
+        if (!entry || typeof entry === 'string') return true;
+        if (!entry.notifiedAt || canonicalKw(entry.notifiedKw) !== normalizedKw) return true;
+        return (Date.now() - entry.notifiedAt) >= DEDUPE_TTL_MS;
+    }
+
+    function markNotified(no, normalizedKw) {
+        const cache = CacheSystem.get();
+        const entry = cache?.[no];
+        let nextEntry = {};
+        if (entry && typeof entry === 'object') {
+            nextEntry = entry;
+        } else if (typeof entry === 'string') {
+            nextEntry = { keyword: entry };
+        }
+        nextEntry.notifiedAt = Date.now();
+        nextEntry.notifiedKw = normalizedKw;
+        cache[no] = nextEntry;
+        localStorage.setItem(CONFIG.CACHE_KEY, JSON.stringify(cache));
+        memoizedCache = cache;
+    }
+
+    function normalizeTerm(term) {
+        return term.trim().replace(/\s+/g, ' ');
+    }
+
+    function normalizeSubject(term) {
+        return normalizeTerm(term).toLowerCase();
+    }
+
+    function normalizeSubjectLabel(label) {
+        if (!label) return '';
+        return normalizeTerm(label.replace(/^\[(.+)\]$/, '$1'));
+    }
+
+    function parseLegacyKeywords(raw) {
+        const cleaned = raw.replace(/\n/g, ',').split(',').map(s => s.trim()).filter(Boolean);
+        const include = [];
+        const exclude = [];
+        cleaned.forEach((item) => {
+            if (item.startsWith('-') && item.length > 1) {
+                exclude.push({ term: normalizeTerm(item.slice(1)), enabled: true });
+            } else {
+                include.push({ term: normalizeTerm(item), enabled: true });
+            }
+        });
+        return {
+            version: 2,
+            updatedAt: Date.now(),
+            include,
+            exclude,
+        };
+    }
+
+    function normalizeList(list) {
+        const map = new Map();
+        list.forEach((item) => {
+            const term = normalizeTerm(item.term || '');
+            if (!term) return;
+            const key = term.toLowerCase();
+            if (!map.has(key)) {
+                map.set(key, { term, enabled: item.enabled !== false });
+            }
+        });
+        return Array.from(map.values());
+    }
+
+    function normalizeSkipSubjects(list) {
+        return normalizeList(list.map(item => {
+            if (typeof item === 'string') {
+                return { term: item, enabled: true };
+            }
+            return { term: item.term || '', enabled: item.enabled !== false };
+        }));
+    }
+
+    function clampThresholdValue(value) {
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) return 1;
+        return Math.min(10, Math.max(1, Math.round(numberValue)));
+    }
+
+    function normalizeAlertThresholds(thresholds) {
+        return {
+            webhook: clampThresholdValue(thresholds?.webhook ?? 1),
+            browser: clampThresholdValue(thresholds?.browser ?? 1),
+            panel: clampThresholdValue(thresholds?.panel ?? 1),
+        };
+    }
+
+    function normalizeMinMatchCount(value) {
+        return clampThresholdValue(value ?? 1);
+    }
+
+    function normalizeNotifyChannels(channels, webhookConfig) {
+        return {
+            panel: channels?.panel !== false,
+            browser: channels?.browser !== false,
+            webhook: channels?.webhook ?? Boolean(webhookConfig?.enabled),
+        };
+    }
+
+    function loadAllowedHeaders() {
+        const raw = localStorage.getItem('dc_radar_allowed_headers');
+        if (!raw) return [];
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                return parsed.map(label => normalizeSubjectLabel(label)).filter(Boolean);
+            }
+        } catch {
+            // ignore
+        }
+        return raw.split(/[,\n]/).map(label => normalizeSubjectLabel(label)).filter(Boolean);
+    }
+
+    function loadAllowedHeadersEnabled() {
+        return localStorage.getItem('dc_radar_allowed_headers_enabled') === 'true';
+    }
+
+    function saveAllowedHeaders() {
+        localStorage.setItem('dc_radar_allowed_headers_enabled', String(allowedHeadersEnabled));
+        localStorage.setItem('dc_radar_allowed_headers', JSON.stringify(allowedHeaders));
+    }
+
+    function isRowAllowedBySubject(row) {
+        if (!allowedHeadersEnabled || allowedHeaders.length === 0) return true;
+        const subject = getRowSubject(row);
+        if (!subject) return false;
+        const normalized = normalizeSubjectLabel(subject);
+        return allowedHeaders
+            .map(item => normalizeSubjectLabel(item))
+            .includes(normalized);
+    }
+
+    function getDefaultWebhookConfig() {
+        return {
+            enabled: false,
+            url: '',
+            gmNotificationEnabled: true,
+        };
+    }
+
+    function getDefaultGallerySettings() {
+        return {
+            include: [],
+            exclude: [],
+            skipSubjects: [],
+            webhookConfig: getDefaultWebhookConfig(),
+            subjectAutoCollected: false,
+            allowViewScan: false,
+            alertThresholds: normalizeAlertThresholds(),
+            minMatchCount: 1,
+            notifyChannels: {
+                panel: true,
+                browser: true,
+                webhook: false,
+            },
+            updatedAt: Date.now(),
+        };
+    }
+
+    function loadSkipSubjects() {
+        const raw = localStorage.getItem(CONFIG.SKIP_SUBJECTS_KEY);
+        if (!raw) return [];
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                return parsed.map(term => normalizeSubjectLabel(term)).filter(Boolean);
+            }
+        } catch {
+            // ignore
+        }
+        return raw.split('\n').map(item => normalizeSubjectLabel(item)).filter(Boolean);
+    }
+
+    function loadSettingsStore() {
+        if (settingsStore) return settingsStore;
+        try {
+            const raw = localStorage.getItem(CONFIG.SETTINGS_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed && parsed.version === 3 && parsed.galleries) {
+                    settingsStore = parsed;
+                    return settingsStore;
+                }
+            }
+        } catch {
+            // fallthrough to migration
+        }
+
+        const migrated = { version: 3, updatedAt: Date.now(), galleries: {} };
+        const legacyRaw = localStorage.getItem(CONFIG.KEYWORD_KEY);
+        if (legacyRaw) {
+            let legacyData = null;
+            try {
+                const parsed = JSON.parse(legacyRaw);
+                if (parsed && parsed.version === 2) {
+                    legacyData = parsed;
+                }
+            } catch {
+                legacyData = parseLegacyKeywords(legacyRaw);
+            }
+            if (!legacyData) {
+                legacyData = parseLegacyKeywords(legacyRaw);
+            }
+            const migratedSkip = loadSkipSubjects();
+            migrated.galleries[CURRENT_GALL_ID] = {
+                include: normalizeList(legacyData.include || []),
+                exclude: normalizeList(legacyData.exclude || []),
+                skipSubjects: normalizeSkipSubjects((legacyData.skipSubjects || migratedSkip).map(item => typeof item === 'string' ? item : item.term)),
+                webhookConfig: getDefaultWebhookConfig(),
+                subjectAutoCollected: false,
+                allowViewScan: false,
+                updatedAt: Date.now(),
+            };
+        }
+        settingsStore = migrated;
+        localStorage.setItem(CONFIG.SETTINGS_KEY, JSON.stringify(settingsStore));
+        return settingsStore;
+    }
+
+    function getGallerySettings() {
+        const store = loadSettingsStore();
+        if (!store.galleries[CURRENT_GALL_ID]) {
+            store.galleries[CURRENT_GALL_ID] = getDefaultGallerySettings();
+            localStorage.setItem(CONFIG.SETTINGS_KEY, JSON.stringify(store));
+        }
+        return store.galleries[CURRENT_GALL_ID];
+    }
+
+    function saveSettingsStore() {
+        if (!settingsStore) return;
+        settingsStore.updatedAt = Date.now();
+        localStorage.setItem(CONFIG.SETTINGS_KEY, JSON.stringify(settingsStore));
+    }
+
+    function loadKeywordData() {
+        const gallSettings = getGallerySettings();
+        keywordData = {
+            ...getDefaultGallerySettings(),
+            ...gallSettings,
+            include: normalizeList(gallSettings.include || []),
+            exclude: normalizeList(gallSettings.exclude || []),
+            skipSubjects: normalizeSkipSubjects(gallSettings.skipSubjects || []),
+            webhookConfig: { ...getDefaultWebhookConfig(), ...(gallSettings.webhookConfig || {}) },
+            alertThresholds: normalizeAlertThresholds(gallSettings.alertThresholds || {}),
+            minMatchCount: normalizeMinMatchCount(gallSettings.minMatchCount),
+            notifyChannels: normalizeNotifyChannels(gallSettings.notifyChannels || {}, gallSettings.webhookConfig),
+        };
+        allowViewScan = Boolean(keywordData.allowViewScan);
+        skipSubjects = [...keywordData.skipSubjects];
+        return keywordData;
+    }
+
+    function saveKeywordData() {
+        if (!keywordData) return;
+        keywordData.include = normalizeList(keywordData.include || []);
+        keywordData.exclude = normalizeList(keywordData.exclude || []);
+        keywordData.skipSubjects = normalizeSkipSubjects(skipSubjects || []);
+        keywordData.updatedAt = Date.now();
+        keywordData.allowViewScan = Boolean(allowViewScan);
+        keywordData.webhookConfig = { ...getDefaultWebhookConfig(), ...(keywordData.webhookConfig || {}) };
+        keywordData.alertThresholds = normalizeAlertThresholds(keywordData.alertThresholds || {});
+        keywordData.minMatchCount = normalizeMinMatchCount(keywordData.minMatchCount);
+        keywordData.notifyChannels = normalizeNotifyChannels(keywordData.notifyChannels || {}, keywordData.webhookConfig);
+        const store = loadSettingsStore();
+        store.galleries[CURRENT_GALL_ID] = { ...keywordData };
+        saveSettingsStore();
+        memoizedRules = null;
+    }
+
+    function getKeywordRules() {
+        if (memoizedRules) return memoizedRules;
+        const data = keywordData || loadKeywordData();
+        const include = data.include
+            .filter(item => item.enabled !== false)
+            .map(item => item.term.toLowerCase());
+        const exclude = data.exclude
+            .filter(item => item.enabled !== false)
+            .map(item => item.term.toLowerCase());
+        memoizedRules = { include: [...new Set(include)], exclude: [...new Set(exclude)] };
+        return memoizedRules;
+    }
+
+    function shouldAllowViewScan() {
+        return Boolean(allowViewScan);
+    }
+
+    function isViewPage() {
+        return window.location.pathname.includes('/board/view') || document.querySelector('.view_content_wrap');
+    }
+    function canLeadNow() {
+        return System.isActiveGall();
+    }
+
+    function canScanNow({ requireMaster = true } = {}) {
+        if (!canLeadNow()) return false;
+        if (isViewPage() && !shouldAllowViewScan()) return false;
+        if (requireMaster && !System.isMaster()) return false;
+        return true;
+    }
+
+    function getViewTarget() {
+        return document.querySelector('.view_content_wrap') || document.querySelector('.write_div') || document.querySelector('#container');
+    }
+
+    function scheduleRestore() {
+        if (restoreScheduled) return;
+        restoreScheduled = true;
+        requestAnimationFrame(() => {
+            restoreScheduled = false;
+            if (document.querySelector('.gall_list .ub-content')) {
+                restoreAllHighlights();
+            }
+            if (isViewPage()) {
+                debugLog('restoreView scheduled via scheduleRestore');
+                restoreViewHighlights();
+            }
+        });
+    }
+
+    function clearRowHighlight(row) {
+        if (!row.dataset.dcRadarKey && !row.classList.contains('dc-radar-detected')) return;
+        row.classList.remove('dc-radar-detected');
+        delete row.dataset.dcRadarKey;
+        const titleLink = row.querySelector('.gall_tit a:not(.reply_numbox)');
+        if (titleLink) {
+            const badge = titleLink.querySelector('.dc-bell-badge');
+            if (badge) badge.remove();
+        }
+        const preview = row.querySelector('.dc-radar-preview');
+        if (preview) preview.remove();
+    }
+
+    function clearAllHighlights() {
+        document.querySelectorAll('.dc-bell-badge').forEach((badge) => badge.remove());
+        document.querySelectorAll('tr.dc-radar-detected').forEach((row) => row.classList.remove('dc-radar-detected'));
+        document.querySelectorAll('[data-dc-radar-key]').forEach((row) => delete row.dataset.dcRadarKey);
+        document.querySelectorAll('.dc-radar-preview').forEach((preview) => preview.remove());
+    }
+
+    function getRowSubject(row) {
+        if (!row) return null;
+        const subjectCell = row.querySelector('.gall_subject, .subject');
+        if (subjectCell && subjectCell.textContent.trim()) return normalizeSubjectLabel(subjectCell.textContent);
+        const fallbackCell = row.querySelector('td:nth-child(2)');
+        if (fallbackCell && fallbackCell.textContent.trim()) return normalizeSubjectLabel(fallbackCell.textContent);
+        const cells = Array.from(row.querySelectorAll('td'));
+        const noticeCell = cells.find(cell => (cell.textContent || '').includes('공지'));
+        if (noticeCell) return '공지';
+        return null;
+    }
+
+    function isExcludedSubject(row) {
+        const subject = getRowSubject(row);
+        if (!subject) return false;
+        const normalized = normalizeSubject(subject);
+        if (CONFIG.SKIP_NOTICE && normalized === '공지') return true;
+        return skipSubjects
+            .filter(item => item.enabled !== false)
+            .map(item => normalizeSubject(item.term))
+            .includes(normalized);
+    }
+
+    function restoreAllHighlights() {
+        const cache = CacheSystem.get();
+        const rules = getKeywordRules();
+        const hasRules = rules.include.length > 0;
+
+        document.querySelectorAll('.gall_list .ub-content').forEach(row => {
+            if (!isRowAllowedBySubject(row)) {
+                clearRowHighlight(row);
+                return;
+            }
+            if (isExcludedSubject(row)) {
+                clearRowHighlight(row);
+                return;
+            }
+            const no = parseNoFromRow(row);
+            const cached = !isNaN(no) ? getCachedEntry(cache[no]) : null;
+            const cachedKeyword = cached?.keyword || null;
+            if (!hasRules || !cachedKeyword) {
+                clearRowHighlight(row);
+                return;
+            }
+            if (shouldIgnoreAnonymousAuthors() && isIpAuthor(cached?.authorNick || '', cached?.authorKey || '', null)) {
+                clearRowHighlight(row);
+                return;
+            }
+            const isValid = rules.include.some(k => cachedKeyword.toLowerCase().includes(k));
+            if (!isValid) {
+                clearRowHighlight(row);
+                return;
+            }
+            applyStyle(row, cachedKeyword);
+            renderPreviewBlock(row, cachedKeyword, cached?.snippet || '');
+        });
+    }
+
+    function applyStyle(row, keyword) {
+        const titleLink = row.querySelector('.gall_tit a:not(.reply_numbox)');
+        if (!titleLink) return;
+        const currentKey = row.dataset.dcRadarKey;
+        let badge = titleLink.querySelector('.dc-bell-badge');
+        if (currentKey === keyword && badge) return;
+        row.classList.add('dc-radar-detected');
+        row.dataset.dcRadarKey = keyword;
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'dc-bell-badge';
+            badge.innerHTML = `<svg class="dc-bell-icon" viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg><span class="dc-radar-badge-text"></span>`;
+            titleLink.appendChild(badge);
+        }
+        const textNode = badge.querySelector('.dc-radar-badge-text');
+        if (textNode) textNode.textContent = keyword;
+    }
+
+    function getCachedEntry(entry) {
+        if (!entry) return null;
+        if (typeof entry === 'string') {
+            return { keyword: entry, snippet: '' };
+        }
+        if (entry.keyword) {
+            return {
+                keyword: entry.keyword,
+                snippet: entry.snippet || '',
+                authorNick: entry.authorNick || '',
+                authorKey: entry.authorKey || '',
+            };
+        }
+        return null;
+    }
+
+    function renderPreviewBlock(row, keyword, snippet) {
+        const titleCell = row.querySelector('.gall_tit') || row.querySelector('.gall_tit a:not(.reply_numbox)')?.closest('td');
+        if (!titleCell) return;
+        const existing = titleCell.querySelector('.dc-radar-preview');
+        if (!snippet) {
+            if (existing) existing.remove();
+            return;
+        }
+        const keywords = (keyword || '').split(',').map(item => item.trim()).filter(Boolean);
+        const preview = document.createElement('div');
+        preview.className = 'dc-radar-preview';
+        preview.innerHTML = `
+            <div class="dc-radar-preview-snippet">${highlightSnippetHTML(snippet, keywords)}</div>
+        `;
+        if (existing) {
+            existing.replaceWith(preview);
+        } else {
+            titleCell.appendChild(preview);
+        }
+    }
+
+    function findRowByNo(no) {
+        if (!Number.isFinite(no)) return null;
+        const rows = document.querySelectorAll('.gall_list .ub-content');
+        for (const row of rows) {
+            if (parseNoFromRow(row) === no) return row;
+        }
+        return null;
+    }
+
+    function insertPreviewForCurrentRow(no, keyword, snippet) {
+        const row = findRowByNo(no);
+        if (!row) return;
+        renderPreviewBlock(row, keyword, snippet);
+    }
+
+    function extractViewContent() {
+        const selectors = ['.write_div', '.view_content_wrap', '#container'];
+        let content = '';
+        selectors.some((sel) => {
+            const el = document.querySelector(sel);
+            if (el && el.textContent.trim()) {
+                content = el.textContent;
+                return true;
+            }
+            return false;
+        });
+        const titleSelectors = ['.title_subject', '.gallview_head .title', '.view_title', '.title_txt'];
+        let title = '';
+        titleSelectors.some((sel) => {
+            const el = document.querySelector(sel);
+            if (el && el.textContent.trim()) {
+                title = el.textContent;
+                return true;
+            }
+            return false;
+        });
+        return { title, content };
+    }
+
+    function restoreViewHighlights() {
+        if (!isViewPage()) return;
+        const target = getViewTarget();
+        if (!target) return;
+        const rules = getKeywordRules();
+        const startTime = performance.now();
+        const { content } = extractViewContent();
+        const text = `${content}`;
+        const textLower = text.toLowerCase();
+        const contentLength = text.length;
+        const noParam = new URLSearchParams(window.location.search).get('no') || '';
+        const rulesHash = `${rules.include.join('|')}|${rules.exclude.join('|')}`;
+        const viewKey = `${noParam}:${rulesHash}:${contentLength}`;
+        const banner = document.getElementById(VIEW_BANNER_ID);
+        if (rules.include.length === 0 || !textLower.trim()) {
+            if (banner) banner.remove();
+            return;
+        }
+        if (banner && banner.dataset.dcRadarViewKey === viewKey) {
+            debugLog('restoreView skipped (same key)');
+            return;
+        }
+        if (rules.exclude.some(x => textLower.includes(x))) {
+            if (banner) banner.remove();
+            return;
+        }
+        const matches = rules.include.filter(k => textLower.includes(k));
+        if (matches.length === 0) {
+            if (banner) banner.remove();
+            return;
+        }
+        const bannerText = matches.join(', ');
+        if (banner && banner.dataset.dcRadarView === bannerText) {
+            debugLog('banner already applied');
+            return;
+        }
+        const newBanner = banner || document.createElement('div');
+        newBanner.id = VIEW_BANNER_ID;
+        newBanner.className = 'dc-radar-view-banner';
+        newBanner.dataset.dcRadarView = bannerText;
+        newBanner.dataset.dcRadarViewKey = viewKey;
+        newBanner.textContent = `🔔 키워드 발견: ${bannerText}`;
+        if (!banner) {
+            target.insertAdjacentElement('afterbegin', newBanner);
+        }
+        debugLog('banner applied');
+        if (noParam) {
+            CacheSystem.set(noParam, bannerText);
+        }
+        debugLog(`restoreView ran in ${Math.round(performance.now() - startTime)}ms, content length=${contentLength}`);
+    }
+
+    function triggerViewRestoreWithRetry() {
+        if (!isViewPage()) return;
+        if (viewRetryTimer) return;
+        const start = performance.now();
+        const attempt = () => {
+            const target = getViewTarget();
+            if (target) {
+                debugLog(`view targets found at t=${Math.round(performance.now() - start)}ms`);
+                restoreViewHighlights();
+                viewRetryTimer = null;
+                viewRetryCount = 0;
+                return;
+            }
+            if (viewRetryCount >= VIEW_RETRY_LIMIT) {
+                debugLog(`view targets not found after ${VIEW_RETRY_LIMIT} retries`);
+                viewRetryTimer = null;
+                viewRetryCount = 0;
+                return;
+            }
+            viewRetryCount += 1;
+            viewRetryTimer = setTimeout(attempt, VIEW_RETRY_INTERVAL);
+            debugLog(`restoreView scheduled retry #${viewRetryCount}`);
+        };
+        attempt();
+    }
+
+    function scheduleSubjectAutoCollect() {
+        if (!keywordData || keywordData.subjectAutoCollected || isViewPage()) return;
+        if (subjectCollectScheduled) return;
+        subjectCollectScheduled = true;
+        requestAnimationFrame(() => {
+            subjectCollectScheduled = false;
+            collectSubjectsOnce();
+        });
+    }
+
+    function collectSubjectsOnce() {
+        if (!keywordData || keywordData.subjectAutoCollected || isViewPage()) return;
+        const subjects = new Set();
+        document.querySelectorAll('.gall_list .ub-content').forEach(row => {
+            const subject = getRowSubject(row);
+            if (!subject) return;
+            subjects.add(subject);
+        });
+        subjects.forEach(subject => {
+            addSkipSubject(subject, { render: false, enabled: false });
+        });
+        keywordData.subjectAutoCollected = true;
+        saveKeywordData();
+        if (renderChipsFn) renderChipsFn();
+        scheduleRestore();
+    }
+
+    function cleanTemplateText(text) {
+        return text
+            .replace(/\{\{[^}]+\}\}/g, ' ')
+            .replace(/<%[\s\S]*?%>/g, ' ')
+            .replace(/\[\[[\s\S]*?\]\]/g, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    const CONTENT_TARGET_SELECTORS = [
+        '.write_div .writing_view_box',
+        '.write_div',
+        '.view_content_wrap',
+        '#container',
+    ];
+    const CONTENT_REMOVE_SELECTORS = [
+        'script',
+        'style',
+        'button',
+        '.btn',
+        '.reply_box',
+        '.comment_box',
+        '.reply',
+        '.writing_view_box .btn',
+        '.writing_view_box .view_comment',
+        '.gallview_head',
+        '.view_comment',
+        '.comment_wrap',
+        '.bottom_paging_box',
+        '.appending_file',
+        '.appending',
+        '.upload_file_box',
+        '.imgwrap',
+        '.img_count',
+        '.recommend_box',
+        '.btn_recommend',
+        '.btnbox',
+        '.view_bottom',
+        '.view_comment_box',
+        '.reply_numbox',
+        '.icon_recomimg',
+        '.gall_writer',
+        '.gall_subject',
+    ];
+
+    function extractCleanContent(doc) {
+        let target = null;
+        CONTENT_TARGET_SELECTORS.some((sel) => {
+            const el = doc.querySelector(sel);
+            if (el && el.textContent.trim()) {
+                target = el;
+                return true;
+            }
+            return false;
+        });
+        if (!target) return '';
+        const clone = target.cloneNode(true);
+        clone.querySelectorAll(CONTENT_REMOVE_SELECTORS.join(',')).forEach(el => el.remove());
+        const text = clone.textContent || '';
+        return cleanTemplateText(text);
+    }
+
+    function createContentSnippet(raw) {
+        const cleaned = cleanTemplateText(raw);
+        if (cleaned.length > 900) {
+            return `${cleaned.slice(0, 900)}…`;
+        }
+        return cleaned;
+    }
+
+    function escapeRegExp(text) {
+        return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function highlightMatchedKeywords(snippet, keywordCsv) {
+        if (!snippet) return '';
+        const keywords = keywordCsv
+            .split(',')
+            .map(k => k.trim())
+            .filter(Boolean);
+        const unique = Array.from(new Set(keywords)).sort((a, b) => b.length - a.length);
+        let result = snippet;
+        unique.forEach((keyword) => {
+            const re = new RegExp(escapeRegExp(keyword), 'gi');
+            result = result.replace(re, match => `[${match}]`);
+        });
+        return result;
+    }
+
+    function escapeHtml(text) {
+        return text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function highlightSnippetHTML(snippet, keywords) {
+        if (!snippet) return '';
+        const safeSnippet = escapeHtml(snippet);
+        const unique = Array.from(new Set(keywords.map(k => k.trim()).filter(Boolean))).sort((a, b) => b.length - a.length);
+        if (unique.length === 0) return safeSnippet;
+        const pattern = unique.map(k => escapeRegExp(k)).join('|');
+        const regex = new RegExp(pattern, 'gi');
+        return safeSnippet.replace(regex, match => `<span class="dc-radar-highlight">${match}</span>`);
+    }
+
+    function isValidGallogId(value) {
+        const trimmed = String(value || '').trim();
+        if (!trimmed) return false;
+        if (/[./]/.test(trimmed)) return false;
+        if (/gallog|dcinside/i.test(trimmed)) return false;
+        if (/\b\d{1,3}(?:\.\d{1,3}){1,3}\b/.test(trimmed)) return false;
+        return true;
+    }
+
+    function extractGallogIdFromWriter(writerEl) {
+        if (!writerEl) return '';
+        const link = writerEl.querySelector('a[href*="gallog.dcinside.com/"]');
+        if (!link) return '';
+        const href = link.getAttribute('href') || '';
+        const match = href.match(/^https?:\/\/gallog\.dcinside\.com\/([^/?#]+)/i);
+        if (match && isValidGallogId(match[1])) {
+            return match[1].trim();
+        }
+        return '';
+    }
+
+    function formatAuthor(nick, gallogId) {
+        const cleanNick = String(nick || '').trim() || '-';
+        const cleanId = isValidGallogId(gallogId) ? String(gallogId).trim() : '';
+        if (cleanId) {
+            return `${cleanNick}(${cleanId})`;
+        }
+        return cleanNick;
+    }
+
+    function extractAuthorInfo(doc) {
+        const writerSelectors = [
+            '.gall_writer',
+            '.ub-writer',
+            '.writer_nikcon',
+            '.view_writer',
+            '.gallview_head .gall_writer',
+        ];
+        const nickSelectors = [
+            '.gall_writer .nickname',
+            '.writer_nick',
+            '.nickname',
+        ];
+        let authorNick = '';
+        let authorKey = '';
+        const writerEl = writerSelectors
+            .map((sel) => doc.querySelector(sel))
+            .find(Boolean);
+        if (writerEl) {
+            authorKey = extractGallogIdFromWriter(writerEl);
+            const nickEl = nickSelectors
+                .map((sel) => writerEl.querySelector(sel))
+                .find(Boolean);
+            if (nickEl && nickEl.textContent.trim()) {
+                authorNick = nickEl.textContent.trim();
+            } else if (writerEl.textContent.trim()) {
+                authorNick = writerEl.textContent.trim();
+            }
+        } else {
+            nickSelectors.some((sel) => {
+                const el = doc.querySelector(sel);
+                if (el && el.textContent.trim()) {
+                    authorNick = el.textContent.trim();
+                    return true;
+                }
+                return false;
+            });
+        }
+        return { authorNick, authorKey };
+    }
+
+    function isIpAuthor(authorNick, authorKey, doc) {
+        const hasGallogLink = doc ? Boolean(doc.querySelector('a[href*="gallog.dcinside.com/"]')) : false;
+        if (authorKey || hasGallogLink) {
+            debugLog('isIpAuthor=false reason=gallog');
+            return false;
+        }
+        const nickText = (authorNick || '').trim();
+        const fullIpPattern = /\b\d{1,3}(?:\.\d{1,3}){3}\b/;
+        const parenIpPattern = /\(\d{1,3}(?:\.\d{1,3}){3}\)/;
+        const telcoPattern = /\b(SKT|KT|LGU\+|LGT|SK|LG)\b/i;
+        if (fullIpPattern.test(nickText) || parenIpPattern.test(nickText) || telcoPattern.test(nickText)) {
+            debugLog('isIpAuthor=true reason=nickPattern');
+            return true;
+        }
+        if (doc) {
+            const ipEl = doc.querySelector('.ip, .writer_ip, .ub-ip, .writer_ip_txt');
+            const ipText = ipEl ? ipEl.textContent.trim() : '';
+            if (ipText && (fullIpPattern.test(ipText) || parenIpPattern.test(ipText) || telcoPattern.test(ipText))) {
+                debugLog('isIpAuthor=true reason=domIpText');
+                return true;
+            }
+        }
+        debugLog('isIpAuthor=false reason=none');
+        return false;
+    }
+
+    function getDefaultGlobalSettings() {
+        return {
+            version: 1,
+            updatedAt: Date.now(),
+            ignoreAnonymousAuthors: false,
+        };
+    }
+
+    function loadGlobalSettings() {
+        if (globalSettings) return globalSettings;
+        try {
+            const raw = localStorage.getItem(CONFIG.GLOBAL_SETTINGS_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed && parsed.version === 1) {
+                    globalSettings = {
+                        ...getDefaultGlobalSettings(),
+                        ...parsed,
+                    };
+                    return globalSettings;
+                }
+            }
+        } catch {
+            // ignore
+        }
+        globalSettings = getDefaultGlobalSettings();
+        localStorage.setItem(CONFIG.GLOBAL_SETTINGS_KEY, JSON.stringify(globalSettings));
+        return globalSettings;
+    }
+
+    function saveGlobalSettings(nextSettings) {
+        globalSettings = {
+            ...getDefaultGlobalSettings(),
+            ...(nextSettings || {}),
+            updatedAt: Date.now(),
+        };
+        localStorage.setItem(CONFIG.GLOBAL_SETTINGS_KEY, JSON.stringify(globalSettings));
+    }
+
+    function shouldIgnoreAnonymousAuthors() {
+        return Boolean(loadGlobalSettings().ignoreAnonymousAuthors);
+    }
+
+    function triggerImmediateScan(reason) {
+        if (!canScanNow()) return;
+        debugLog(`triggerImmediateScan(${reason})`);
+        scanNewPosts();
+    }
+
+    // =================================================================
+    // 🧩 UI 및 실행
+    // =================================================================
+    function findHeaderTarget() {
+        const selectors = [
+            '.page_head.clear',
+            '.gall_info',
+            '.gall_tit',
+            '.gallname',
+            '.gallnamebox',
+            '.gallname_area',
+            'header.page_head',
+            '.left_content header',
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) return el;
+        }
+        const titleEl = document.querySelector('h1, h2, strong');
+        if (titleEl && titleEl.textContent.includes('갤러리')) {
+            return titleEl.parentElement;
+        }
+        return document.querySelector('.list_array_option') || document.querySelector('.right_box');
+    }
+
+    function createButtonContainer() {
+        const container = document.createElement('div');
+        container.id = 'dc-radar-header-container';
+        container.className = 'dc-radar-container';
+        container.style.cssText = 'display:inline-flex; align-items:center; gap:6px; margin-left:8px;';
+
+        const btn = document.createElement('div');
+        btn.className = 'dc-radar-icon-btn';
+        btn.innerHTML = `
+            <div class="dc-radar-bell">🔔</div>
+            <div class="dc-radar-status-dot" id="radarStatusDot"></div>
+        `;
+        container.appendChild(btn);
+        return { container, btn };
+    }
+
+    function ensureButtonMounted(container) {
+        const targetHeader = findHeaderTarget();
+        if (!targetHeader) return;
+        if (!targetHeader.contains(container)) {
+            if (getComputedStyle(targetHeader).display.includes('flex')) {
+                container.style.marginLeft = 'auto';
+            }
+            targetHeader.appendChild(container);
+        }
+    }
+
+    function initUI() {
+        const { container, btn } = createButtonContainer();
+        if (!document.body) return;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'dc-radar-overlay';
+        overlay.innerHTML = `
+            <div class="dc-radar-modal" role="dialog" aria-modal="true">
+                <div class="dc-radar-modal-header">
+                    <div class="dc-radar-modal-header-top">
+                        <div class="dc-radar-modal-title">🔔 DC-Radar 설정</div>
+                        <div class="dc-radar-modal-close" id="radarModalClose">✕</div>
+                    </div>
+                    <div class="dc-radar-status-pills">
+                        <span class="dc-radar-pill off" id="radarActiveStatus">감시 OFF</span>
+                        <span class="dc-radar-pill off" id="radarWebhookStatus">웹훅 OFF</span>
+                        <span class="dc-radar-pill off" id="radarWhitelistStatus">말머리 ALL</span>
+                        <button class="dc-radar-pill" id="openWhitelistBtn">🏷️ 허용 말머리</button>
+                    </div>
+                </div>
+                <div class="dc-radar-modal-body">
+                    <div class="dc-radar-tabs">
+                        <div class="dc-radar-tab active" data-tab="keyword">키워드</div>
+                        <div class="dc-radar-tab" data-tab="display">표시(하이라이트/미리보기)</div>
+                        <div class="dc-radar-tab" data-tab="notify">알림(브라우저/웹훅)</div>
+                        <div class="dc-radar-tab" data-tab="transfer">내보내기/불러오기</div>
+                    </div>
+                    <div class="dc-radar-section active" data-section="keyword">
+                        <div class="dc-radar-help">포함/제외 키워드를 chip 형태로 관리합니다. 클릭하면 활성/비활성 토글됩니다.</div>
+                        <div class="dc-radar-section-header">
+                            <strong>포함 키워드 <span id="includeCount">(0)</span></strong>
+                            <button data-target="include">접기/펼치기</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <input type="text" id="includeInput" placeholder="포함 키워드 추가">
+                            <button id="includeAddBtn">추가</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <button id="includeClearBtn">포함 키워드 전체 삭제</button>
+                        </div>
+                        <div class="dc-radar-chips-wrapper collapsed" data-chips="include">
+                            <div class="dc-radar-chips" id="includeChips"></div>
+                        </div>
+                        <div class="dc-radar-section-header">
+                            <strong>제외 키워드 <span id="excludeCount">(0)</span></strong>
+                            <button data-target="exclude">접기/펼치기</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <input type="text" id="excludeInput" placeholder="제외 키워드 추가">
+                            <button id="excludeAddBtn">추가</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <button id="excludeClearBtn">제외 키워드 전체 삭제</button>
+                        </div>
+                        <div class="dc-radar-chips-wrapper collapsed" data-chips="exclude">
+                            <div class="dc-radar-chips" id="excludeChips"></div>
+                        </div>
+                        <div class="dc-radar-section-header">
+                            <strong>제외 말머리 <span id="skipSubjectCount">(0)</span></strong>
+                            <button data-target="skipSubject">접기/펼치기</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <input type="text" id="skipSubjectInput" placeholder="제외 말머리 추가">
+                            <button id="skipSubjectAddBtn">추가</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <button id="skipSubjectClearBtn">제외 말머리 전체 삭제</button>
+                        </div>
+                        <div class="dc-radar-chips-wrapper collapsed" data-chips="skipSubject">
+                            <div class="dc-radar-chips" id="skipSubjectChips"></div>
+                        </div>
+                    </div>
+                    <div class="dc-radar-section" data-section="display">
+                        <div class="dc-radar-help">하이라이트/미리보기 표시 동작을 설정합니다. 갤러리별 설정이 아닌 전역 옵션도 포함됩니다.</div>
+                        <div class="dc-radar-row">
+                            <label><input type="checkbox" id="ignoreAnonymousToggle"> 유동닉(IP/통신사) 글은 알림/미리보기 제외</label>
+                        </div>
+                    </div>
+                    <div class="dc-radar-section" data-section="notify">
+                        <div class="dc-radar-help">브라우저 알림과 디스코드 웹훅 전송을 설정합니다.</div>
+                        <div class="dc-radar-row">
+                            <input type="text" id="webhookUrlInput" placeholder="디스코드 웹훅 URL 입력">
+                        </div>
+                        <div class="dc-radar-row">
+                            <label><input type="checkbox" id="allowViewScanToggle"> View 페이지에서도 감시 유지</label>
+                        </div>
+                        <div class="dc-radar-row">
+                            <label>최소 키워드 개수 <input type="number" id="minMatchCountInput" min="1" max="10"></label>
+                        </div>
+                        <div class="dc-radar-row">
+                            <label><input type="checkbox" id="channelBrowserToggle"> 브라우저 알림 사용</label>
+                            <label><input type="checkbox" id="channelWebhookToggle"> 디스코드 웹훅 사용</label>
+                        </div>
+                    </div>
+                    <div class="dc-radar-section dc-radar-transfer" data-section="transfer">
+                        <textarea id="transferArea" placeholder="여기에 JSON을 내보내기/불러오기"></textarea>
+                        <div class="dc-radar-row">
+                            <button id="exportBtn">내보내기</button>
+                            <button id="copyBtn">클립보드 복사</button>
+                            <button id="downloadBtn">파일 저장</button>
+                        </div>
+                        <div class="dc-radar-row">
+                            <button id="importMergeBtn">불러오기(병합)</button>
+                            <button id="importReplaceBtn">불러오기(덮어쓰기)</button>
+                        </div>
+                        <div class="dc-radar-error" id="transferError"></div>
+                    </div>
+                </div>
+                <div class="dc-radar-modal-footer">
+                    <button class="dc-radar-footer-btn save" id="radarSaveBtn">저장</button>
+                    <button class="dc-radar-footer-btn close" id="radarCloseBtn">닫기</button>
+                    <button class="dc-radar-footer-btn clear" id="radarClearBtn">캐시 초기화</button>
+                </div>
+            </div>
+        `;
+
+        const whitelistOverlay = document.createElement('div');
+        whitelistOverlay.className = 'dc-radar-whitelist-overlay';
+        whitelistOverlay.innerHTML = `
+            <div class="dc-radar-whitelist-modal" role="dialog" aria-modal="true">
+                <div class="dc-radar-row" style="justify-content:space-between;">
+                    <strong>허용 말머리 설정</strong>
+                    <button id="whitelistCloseBtn">✕</button>
+                </div>
+                <div class="dc-radar-row">
+                    <label><input type="checkbox" id="whitelistEnableToggle"> 허용 말머리 사용</label>
+                </div>
+                <textarea id="whitelistTextarea" placeholder="줄 또는 쉼표로 구분하여 입력"></textarea>
+                <div class="dc-radar-whitelist-actions">
+                    <button id="whitelistSaveBtn" style="background:#e03131;color:#fff;">저장</button>
+                    <button id="whitelistResetBtn" style="background:#343a40;color:#fff;">초기화</button>
+                    <button id="whitelistCancelBtn" style="background:#dee2e6;color:#333;">취소</button>
+                </div>
+            </div>
+        `;
+
+        ensureButtonMounted(container);
+        document.body.appendChild(overlay);
+        document.body.appendChild(whitelistOverlay);
+
+        const dot = container.querySelector('#radarStatusDot');
+        const includeInput = overlay.querySelector('#includeInput');
+        const excludeInput = overlay.querySelector('#excludeInput');
+        const skipSubjectInput = overlay.querySelector('#skipSubjectInput');
+        const includeChips = overlay.querySelector('#includeChips');
+        const excludeChips = overlay.querySelector('#excludeChips');
+        const skipSubjectChips = overlay.querySelector('#skipSubjectChips');
+        const transferArea = overlay.querySelector('#transferArea');
+        const transferError = overlay.querySelector('#transferError');
+        const webhookUrlInput = overlay.querySelector('#webhookUrlInput');
+        const allowViewScanToggle = overlay.querySelector('#allowViewScanToggle');
+        const ignoreAnonymousToggle = overlay.querySelector('#ignoreAnonymousToggle');
+        const minMatchCountInput = overlay.querySelector('#minMatchCountInput');
+        const channelBrowserToggle = overlay.querySelector('#channelBrowserToggle');
+        const channelWebhookToggle = overlay.querySelector('#channelWebhookToggle');
+        const includeClearBtn = overlay.querySelector('#includeClearBtn');
+        const excludeClearBtn = overlay.querySelector('#excludeClearBtn');
+        const skipSubjectClearBtn = overlay.querySelector('#skipSubjectClearBtn');
+        const includeCount = overlay.querySelector('#includeCount');
+        const excludeCount = overlay.querySelector('#excludeCount');
+        const skipSubjectCount = overlay.querySelector('#skipSubjectCount');
+        const radarActiveStatus = overlay.querySelector('#radarActiveStatus');
+        const radarWebhookStatus = overlay.querySelector('#radarWebhookStatus');
+        const radarWhitelistStatus = overlay.querySelector('#radarWhitelistStatus');
+        const openWhitelistBtn = overlay.querySelector('#openWhitelistBtn');
+        const whitelistEnableToggle = whitelistOverlay.querySelector('#whitelistEnableToggle');
+        const whitelistTextarea = whitelistOverlay.querySelector('#whitelistTextarea');
+
+        function openModal() {
+            overlay.classList.add('show');
+        }
+
+        function closeModal() {
+            overlay.classList.remove('show');
+            transferError.textContent = '';
+        }
+
+        function openWhitelistModal() {
+            whitelistOverlay.classList.add('show');
+            whitelistEnableToggle.checked = allowedHeadersEnabled;
+            whitelistTextarea.value = allowedHeaders.join('\n');
+        }
+
+        function closeWhitelistModal() {
+            whitelistOverlay.classList.remove('show');
+        }
+
+        function switchTab(tabName) {
+            overlay.querySelectorAll('.dc-radar-tab').forEach(tab => {
+                tab.classList.toggle('active', tab.dataset.tab === tabName);
+            });
+            overlay.querySelectorAll('.dc-radar-section').forEach(section => {
+                section.classList.toggle('active', section.dataset.section === tabName);
+            });
+        }
+
+        function renderStatusPills() {
+            const active = System.isActiveGall();
+            const isMaster = System.isMaster();
+            radarActiveStatus.className = 'dc-radar-pill';
+            if (!active) {
+                radarActiveStatus.classList.add('off');
+                radarActiveStatus.textContent = '감시 OFF';
+            } else if (isMaster) {
+                radarActiveStatus.classList.add('master');
+                radarActiveStatus.textContent = 'MASTER';
+            } else {
+                radarActiveStatus.classList.add('slave');
+                radarActiveStatus.textContent = 'SLAVE';
+            }
+            const webhookEnabled = normalizeNotifyChannels(keywordData?.notifyChannels || {}, keywordData?.webhookConfig).webhook;
+            radarWebhookStatus.className = `dc-radar-pill ${webhookEnabled ? 'on' : 'off'}`;
+            radarWebhookStatus.textContent = webhookEnabled ? '웹훅 ON' : '웹훅 OFF';
+            radarWhitelistStatus.className = `dc-radar-pill ${allowedHeadersEnabled && allowedHeaders.length > 0 ? 'on' : 'off'}`;
+            radarWhitelistStatus.textContent = allowedHeadersEnabled && allowedHeaders.length > 0 ? '말머리 제한' : '말머리 ALL';
+        }
+
+        function renderChips() {
+            if (!keywordData) loadKeywordData();
+            includeChips.innerHTML = '';
+            excludeChips.innerHTML = '';
+            skipSubjectChips.innerHTML = '';
+            keywordData.include.forEach((item, idx) => {
+                const chip = document.createElement('div');
+                chip.className = `dc-radar-chip ${item.enabled === false ? 'disabled' : ''}`;
+                chip.innerHTML = `<span>${item.term}</span><span class="dc-radar-chip-close" data-type="include" data-index="${idx}">×</span>`;
+                chip.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('dc-radar-chip-close')) return;
+                    item.enabled = item.enabled === false;
+                    renderChips();
+                });
+                includeChips.appendChild(chip);
+            });
+            keywordData.exclude.forEach((item, idx) => {
+                const chip = document.createElement('div');
+                chip.className = `dc-radar-chip ${item.enabled === false ? 'disabled' : ''}`;
+                chip.innerHTML = `<span>${item.term}</span><span class="dc-radar-chip-close" data-type="exclude" data-index="${idx}">×</span>`;
+                chip.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('dc-radar-chip-close')) return;
+                    item.enabled = item.enabled === false;
+                    renderChips();
+                });
+                excludeChips.appendChild(chip);
+            });
+            skipSubjects.forEach((item, idx) => {
+                const chip = document.createElement('div');
+                chip.className = `dc-radar-chip ${item.enabled === false ? 'disabled' : ''}`;
+                chip.innerHTML = `<span>${item.term}</span><span class="dc-radar-chip-close" data-type="skipSubject" data-index="${idx}">×</span>`;
+                chip.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('dc-radar-chip-close')) return;
+                    item.enabled = item.enabled === false;
+                    renderChips();
+                });
+                skipSubjectChips.appendChild(chip);
+            });
+            includeCount.textContent = `(${keywordData.include.length})`;
+            excludeCount.textContent = `(${keywordData.exclude.length})`;
+            skipSubjectCount.textContent = `(${skipSubjects.length})`;
+            renderWebhookSettings();
+            renderStatusPills();
+        }
+        renderChipsFn = renderChips;
+
+        function renderWebhookSettings() {
+            if (!keywordData) return;
+            webhookUrlInput.value = keywordData.webhookConfig?.url || '';
+            allowViewScanToggle.checked = Boolean(allowViewScan);
+            ignoreAnonymousToggle.checked = shouldIgnoreAnonymousAuthors();
+            minMatchCountInput.value = normalizeMinMatchCount(keywordData.minMatchCount);
+            const channels = normalizeNotifyChannels(keywordData.notifyChannels || {}, keywordData.webhookConfig);
+            channelBrowserToggle.checked = channels.browser;
+            channelWebhookToggle.checked = channels.webhook;
+        }
+
+        function addKeyword(type, term) {
+            const normalized = normalizeTerm(term);
+            if (!normalized) return;
+            const list = type === 'include' ? keywordData.include : keywordData.exclude;
+            const exists = list.some(item => item.term.toLowerCase() === normalized.toLowerCase());
+            if (exists) return;
+            list.push({ term: normalized, enabled: true });
+            renderChips();
+        }
+
+        function addSkipSubject(term, options = {}) {
+            const normalized = normalizeSubjectLabel(term);
+            if (!normalized) return;
+            const exists = skipSubjects.some(item => normalizeSubject(item.term) === normalizeSubject(normalized));
+            if (exists) return;
+            const enabled = options.enabled !== undefined ? Boolean(options.enabled) : true;
+            skipSubjects.push({ term: normalized, enabled });
+            if (options.render !== false) {
+                renderChips();
+            }
+        }
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) closeModal();
+        });
+
+        whitelistOverlay.addEventListener('click', (e) => {
+            if (e.target === whitelistOverlay) closeWhitelistModal();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeModal();
+                closeWhitelistModal();
+            }
+        });
+
+        overlay.querySelector('#radarModalClose').onclick = closeModal;
+        overlay.querySelector('#radarCloseBtn').onclick = closeModal;
+        whitelistOverlay.querySelector('#whitelistCloseBtn').onclick = closeWhitelistModal;
+        whitelistOverlay.querySelector('#whitelistCancelBtn').onclick = closeWhitelistModal;
+
+        overlay.querySelectorAll('.dc-radar-tab').forEach(tab => {
+            tab.addEventListener('click', () => switchTab(tab.dataset.tab));
+        });
+
+        overlay.querySelectorAll('.dc-radar-section-header button').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const target = btn.dataset.target;
+                const section = overlay.querySelector(`[data-chips="${target}"]`);
+                if (section) {
+                    section.classList.toggle('collapsed');
+                }
+            });
+        });
+
+        includeInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addKeyword('include', includeInput.value);
+                includeInput.value = '';
+            }
+        });
+
+        excludeInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addKeyword('exclude', excludeInput.value);
+                excludeInput.value = '';
+            }
+        });
+
+        skipSubjectInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addSkipSubject(skipSubjectInput.value);
+                skipSubjectInput.value = '';
+            }
+        });
+
+        overlay.querySelector('#includeAddBtn').onclick = () => {
+            addKeyword('include', includeInput.value);
+            includeInput.value = '';
+        };
+        overlay.querySelector('#excludeAddBtn').onclick = () => {
+            addKeyword('exclude', excludeInput.value);
+            excludeInput.value = '';
+        };
+        overlay.querySelector('#skipSubjectAddBtn').onclick = () => {
+            addSkipSubject(skipSubjectInput.value);
+            skipSubjectInput.value = '';
+        };
+
+        includeClearBtn.addEventListener('click', () => {
+            if (!confirm('포함 키워드를 모두 삭제할까요?')) return;
+            keywordData.include = [];
+            renderChips();
+            saveKeywordData();
+            scheduleRestore();
+            triggerImmediateScan('include-clear');
+        });
+
+        excludeClearBtn.addEventListener('click', () => {
+            if (!confirm('제외 키워드를 모두 삭제할까요?')) return;
+            keywordData.exclude = [];
+            renderChips();
+            saveKeywordData();
+            scheduleRestore();
+            triggerImmediateScan('exclude-clear');
+        });
+
+        skipSubjectClearBtn.addEventListener('click', () => {
+            if (!confirm('제외 말머리를 모두 삭제할까요?')) return;
+            skipSubjects = [];
+            renderChips();
+            saveKeywordData();
+            scheduleRestore();
+            triggerImmediateScan('skip-subject-clear');
+        });
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target.classList.contains('dc-radar-chip-close')) {
+                const type = e.target.dataset.type;
+                const index = Number(e.target.dataset.index);
+                if (type === 'skipSubject') {
+                    skipSubjects.splice(index, 1);
+                } else {
+                    const list = type === 'include' ? keywordData.include : keywordData.exclude;
+                    list.splice(index, 1);
+                }
+                renderChips();
+            }
+        });
+
+        openWhitelistBtn.addEventListener('click', () => {
+            openWhitelistModal();
+        });
+
+        whitelistOverlay.querySelector('#whitelistSaveBtn').onclick = () => {
+            allowedHeadersEnabled = whitelistEnableToggle.checked;
+            allowedHeaders = whitelistTextarea.value
+                .split(/\n|,/)
+                .map(item => normalizeSubjectLabel(item))
+                .filter(Boolean);
+            saveAllowedHeaders();
+            scheduleRestore();
+            renderChips();
+            triggerImmediateScan('whitelist-save');
+            closeWhitelistModal();
+        };
+
+        whitelistOverlay.querySelector('#whitelistResetBtn').onclick = () => {
+            allowedHeaders = [];
+            allowedHeadersEnabled = false;
+            whitelistEnableToggle.checked = false;
+            whitelistTextarea.value = '';
+            saveAllowedHeaders();
+            scheduleRestore();
+            renderChips();
+            triggerImmediateScan('whitelist-save');
+        };
+
+        webhookUrlInput.addEventListener('input', () => {
+            keywordData.webhookConfig = keywordData.webhookConfig || getDefaultWebhookConfig();
+            keywordData.webhookConfig.url = webhookUrlInput.value.trim();
+        });
+
+        allowViewScanToggle.addEventListener('change', () => {
+            allowViewScan = allowViewScanToggle.checked;
+            renderWebhookSettings();
+            System.electLeader();
+        });
+
+        ignoreAnonymousToggle.addEventListener('change', () => {
+            saveGlobalSettings({
+                ...loadGlobalSettings(),
+                ignoreAnonymousAuthors: ignoreAnonymousToggle.checked,
+            });
+            renderWebhookSettings();
+            scheduleRestore();
+        });
+
+        minMatchCountInput.addEventListener('input', () => {
+            keywordData.minMatchCount = normalizeMinMatchCount(minMatchCountInput.value);
+            renderWebhookSettings();
+        });
+
+        channelBrowserToggle.addEventListener('change', () => {
+            keywordData.notifyChannels = normalizeNotifyChannels({
+                ...(keywordData.notifyChannels || {}),
+                browser: channelBrowserToggle.checked,
+            }, keywordData.webhookConfig);
+            keywordData.webhookConfig = keywordData.webhookConfig || getDefaultWebhookConfig();
+            keywordData.webhookConfig.gmNotificationEnabled = channelBrowserToggle.checked;
+            renderWebhookSettings();
+        });
+
+        channelWebhookToggle.addEventListener('change', () => {
+            keywordData.notifyChannels = normalizeNotifyChannels({
+                ...(keywordData.notifyChannels || {}),
+                webhook: channelWebhookToggle.checked,
+            }, keywordData.webhookConfig);
+            keywordData.webhookConfig = keywordData.webhookConfig || getDefaultWebhookConfig();
+            keywordData.webhookConfig.enabled = channelWebhookToggle.checked;
+            renderStatusPills();
+            renderWebhookSettings();
+        });
+
+        overlay.querySelector('#exportBtn').onclick = () => {
+            saveKeywordData();
+            const exportData = { ...keywordData, skipSubjects: [...skipSubjects] };
+            transferArea.value = JSON.stringify(exportData, null, 2);
+            transferError.textContent = '';
+        };
+        overlay.querySelector('#copyBtn').onclick = async () => {
+            try {
+                const exportData = { ...keywordData, skipSubjects: [...skipSubjects] };
+                await navigator.clipboard.writeText(transferArea.value || JSON.stringify(exportData, null, 2));
+                transferError.textContent = '클립보드에 복사되었습니다.';
+            } catch {
+                transferError.textContent = '클립보드 복사 실패.';
+            }
+        };
+        overlay.querySelector('#downloadBtn').onclick = () => {
+            saveKeywordData();
+            const exportData = { ...keywordData, skipSubjects: [...skipSubjects] };
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'dc-radar-keywords.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        };
+
+        function validateImport(data) {
+            if (!data || !Array.isArray(data.include) || !Array.isArray(data.exclude)) {
+                throw new Error('include/exclude 배열이 필요합니다.');
+            }
+            const normalizeItem = (item) => ({
+                term: normalizeTerm(String(item.term || '')),
+                enabled: item.enabled !== false,
+            });
+            const normalizeSubjects = (list) => normalizeSkipSubjects(list.map(term => {
+                if (typeof term === 'string') {
+                    return { term: normalizeTerm(String(term || '')), enabled: true };
+                }
+                return { term: normalizeTerm(String(term.term || '')), enabled: term.enabled !== false };
+            }));
+            return {
+                version: 3,
+                updatedAt: Date.now(),
+                include: normalizeList(data.include.map(normalizeItem)),
+                exclude: normalizeList(data.exclude.map(normalizeItem)),
+                skipSubjects: normalizeSubjects(data.skipSubjects || []),
+                webhookConfig: { ...getDefaultWebhookConfig(), ...(data.webhookConfig || {}) },
+                subjectAutoCollected: Boolean(data.subjectAutoCollected),
+                allowViewScan: Boolean(data.allowViewScan),
+                alertThresholds: normalizeAlertThresholds(data.alertThresholds || {}),
+                minMatchCount: normalizeMinMatchCount(data.minMatchCount),
+                notifyChannels: normalizeNotifyChannels(data.notifyChannels || {}, data.webhookConfig || {}),
+            };
+        }
+
+        function importData(mode) {
+            transferError.textContent = '';
+            try {
+                const parsed = JSON.parse(transferArea.value);
+                const incoming = validateImport(parsed);
+                if (mode === 'replace') {
+                    keywordData = incoming;
+                    skipSubjects = [...incoming.skipSubjects];
+                } else {
+                    const mergeList = (base, add) => {
+                        const map = new Map(base.map(item => [item.term.toLowerCase(), item]));
+                        add.forEach(item => {
+                            const key = item.term.toLowerCase();
+                            if (!map.has(key)) {
+                                map.set(key, item);
+                            }
+                        });
+                        return Array.from(map.values());
+                    };
+                    keywordData.include = mergeList(keywordData.include, incoming.include);
+                    keywordData.exclude = mergeList(keywordData.exclude, incoming.exclude);
+                    const mergedSubjects = new Map(skipSubjects.map(item => [normalizeSubject(item.term), item]));
+                    incoming.skipSubjects.forEach(item => {
+                        const key = normalizeSubject(item.term);
+                        if (!mergedSubjects.has(key)) {
+                            mergedSubjects.set(key, item);
+                        }
+                    });
+                    skipSubjects = Array.from(mergedSubjects.values());
+                    keywordData.webhookConfig = { ...keywordData.webhookConfig, ...incoming.webhookConfig };
+                    keywordData.alertThresholds = normalizeAlertThresholds({
+                        ...(keywordData.alertThresholds || {}),
+                        ...(incoming.alertThresholds || {}),
+                    });
+                    keywordData.minMatchCount = normalizeMinMatchCount(incoming.minMatchCount ?? keywordData.minMatchCount);
+                    keywordData.notifyChannels = normalizeNotifyChannels({
+                        ...(keywordData.notifyChannels || {}),
+                        ...(incoming.notifyChannels || {}),
+                    }, keywordData.webhookConfig);
+                }
+                allowViewScan = Boolean(incoming.allowViewScan);
+                saveKeywordData();
+                renderChips();
+                scheduleRestore();
+                transferError.textContent = '불러오기 성공.';
+                triggerImmediateScan('import');
+            } catch (err) {
+                transferError.textContent = `불러오기 실패: ${err.message}`;
+            }
+        }
+
+        overlay.querySelector('#importMergeBtn').onclick = () => importData('merge');
+        overlay.querySelector('#importReplaceBtn').onclick = () => importData('replace');
+
+        dot.onclick = (e) => {
+            e.stopPropagation();
+            const isTargetOff = localStorage.getItem(CONFIG.GLOBAL_ACTIVE_GALLERY) !== CURRENT_GALL_ID;
+
+            if (isTargetOff) {
+                localStorage.setItem(CONFIG.GLOBAL_ACTIVE_GALLERY, CURRENT_GALL_ID);
+                localStorage.setItem(CONFIG.LEADER_KEY, JSON.stringify({ tabId: TAB_ID, ts: Date.now() }));
+                alert(`📡 [${CURRENT_GALL_ID}] 갤러리를 활성 갤러리로 지정합니다.`);
+            } else {
+                localStorage.removeItem(CONFIG.GLOBAL_ACTIVE_GALLERY);
+                localStorage.removeItem(CONFIG.LEADER_KEY);
+                alert('🛑 감시를 완전히 중단합니다.');
+            }
+            System.updateUI();
+            System.electLeader();
+            renderStatusPills();
+        };
+
+        btn.onclick = (e) => {
+            if (e.target.closest('#radarStatusDot')) return;
+            overlay.classList.contains('show') ? closeModal() : openModal();
+        };
+
+        overlay.querySelector('#radarSaveBtn').onclick = () => {
+            saveKeywordData();
+            scheduleRestore();
+            closeModal();
+            triggerImmediateScan('settings-save');
+        };
+
+        overlay.querySelector('#radarClearBtn').onclick = () => {
+            if (!confirm('캐시를 초기화할까요?')) return;
+            CacheSystem.clear();
+            clearAllHighlights();
+        };
+
+        loadKeywordData();
+        renderChips();
+        System.updateUI();
+        System.electLeader();
+        if (CONFIG.DEBUG) {
+            debugLog(`location=${window.location.href}`);
+            debugLog(`pathname=${window.location.pathname}`);
+            debugLog(`CURRENT_GALL_ID=${CURRENT_GALL_ID}`);
+            debugLog(`activeGall=${localStorage.getItem(CONFIG.GLOBAL_ACTIVE_GALLERY) || '-'} isActive=${System.isActiveGall()} isMaster=${System.isMaster()}`);
+        }
+        if (isViewPage()) {
+            triggerViewRestoreWithRetry();
+        }
+        scheduleRestore();
+        scheduleSubjectAutoCollect();
+
+        const observer = new MutationObserver(() => {
+            ensureButtonMounted(container);
+            scheduleRestore();
+            scheduleSubjectAutoCollect();
+        });
+        const listTarget = document.querySelector('.gall_list') || document.querySelector('#container') || document.body;
+        observer.observe(listTarget, { childList: true, subtree: true });
+
+        setInterval(() => ensureButtonMounted(container), 2000);
+
+        setInterval(() => System.electLeader(), CONFIG.HEARTBEAT_INTERVAL);
+    }
+
+    // 타 탭에서 발생하는 변화 감시 (localStorage 동기화 핵심)
+    window.addEventListener('storage', (e) => {
+        if (e.key === CONFIG.GLOBAL_ACTIVE_GALLERY || e.key === CONFIG.LEADER_KEY) {
+            System.updateUI();
+            System.electLeader();
+        }
+        if (e.key === CONFIG.CACHE_KEY) {
+            memoizedCache = null;
+            scheduleRestore();
+        }
+        if (e.key === CONFIG.SETTINGS_KEY) {
+            settingsStore = null;
+            memoizedRules = null;
+            loadKeywordData();
+            if (renderChipsFn) renderChipsFn();
+            triggerViewRestoreWithRetry();
+            scheduleRestore();
+            triggerImmediateScan('settings-sync');
+        }
+        if (e.key === CONFIG.KEYWORD_KEY) {
+            memoizedRules = null;
+            loadKeywordData();
+            if (renderChipsFn) renderChipsFn();
+            triggerViewRestoreWithRetry();
+            scheduleRestore();
+            triggerImmediateScan('keyword-sync');
+        }
+        if (e.key === CONFIG.GLOBAL_SETTINGS_KEY) {
+            globalSettings = null;
+            if (renderChipsFn) renderChipsFn();
+            scheduleRestore();
+        }
+        if (e.key === 'dc_radar_allowed_headers' || e.key === 'dc_radar_allowed_headers_enabled') {
+            allowedHeaders = loadAllowedHeaders();
+            allowedHeadersEnabled = loadAllowedHeadersEnabled();
+            scheduleRestore();
+            if (renderChipsFn) renderChipsFn();
+        }
+    });
+
+    window.addEventListener('beforeunload', () => {
+        if (System.isMaster()) {
+            localStorage.removeItem(CONFIG.LEADER_KEY);
+        }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        const nowView = isViewPage();
+        if (lastWasViewPage && !nowView && !shouldAllowViewScan()) {
+            triggerImmediateScan('return-from-view');
+        } else {
+            triggerImmediateScan('visibility');
+        }
+        lastWasViewPage = nowView;
+    });
+
+    window.addEventListener('focus', () => {
+        triggerImmediateScan('focus');
+    });
+
+    window.addEventListener('resize', () => {
+        scheduleIndependentPanelLayout();
+    });
+
+    // =================================================================
+    // 🕵️‍♂️ 스캐너 (마스터 탭 전용)
+    // =================================================================
+    let latestNo = 0;
+
+    function startRadarInternal() {
+        if (!canScanNow()) return;
+        document.querySelectorAll('.gall_list .ub-content').forEach(row => {
+            const no = parseNoFromRow(row);
+            if (!isNaN(no) && no > latestNo) latestNo = no;
+        });
+        if (radarInterval) clearInterval(radarInterval);
+        radarInterval = setInterval(scanNewPosts, CONFIG.INTERVAL);
+    }
+
+    async function scanNewPosts() {
+        if (!canScanNow()) return;
+        if (isScanning) return;
+        if (backoffUntil && backoffUntil > Date.now()) return;
+
+        isScanning = true;
+        scanMetrics.runs += 1;
+        try {
+            const rules = getKeywordRules();
+            const shouldUseListUrl = isViewPage() || !document.querySelector('.gall_list .ub-content');
+            const listUrl = shouldUseListUrl
+                ? buildListUrl(CURRENT_GALL_ID)
+                : (window.location.href.split('?')[0] + window.location.search);
+            if (CONFIG.DEBUG) {
+                debugLog(`location=${window.location.href}`);
+                debugLog(`pathname=${window.location.pathname}`);
+                debugLog(`CURRENT_GALL_ID=${CURRENT_GALL_ID}`);
+                debugLog(`activeGall=${localStorage.getItem(CONFIG.GLOBAL_ACTIVE_GALLERY) || '-'} isActive=${System.isActiveGall()}`);
+                debugLog(`rules.include.length=${rules.include.length}`);
+                debugLog(`listUrl=${listUrl} (forced=${shouldUseListUrl})`);
+                debugLog('scanNewPosts start');
+            }
+            if (rules.include.length === 0) return;
+            const listHtml = await safeFetchHTML(listUrl, CONFIG.REQUEST_TIMEOUT);
+            const doc = new DOMParser().parseFromString(listHtml, 'text/html');
+            const listRows = Array.from(getListRows(doc));
+            const parsedRows = listRows
+                .filter(row => isRowAllowedBySubject(row))
+                .filter(row => !isExcludedSubject(row))
+                .map(row => {
+                    const link = row.querySelector('.gall_tit a:not(.reply_numbox)');
+                    const no = parseNoFromRow(row);
+                    return {
+                        no,
+                        url: link?.href,
+                        title: link?.innerText
+                    };
+                })
+                .filter(item => !isNaN(item.no) && item.url);
+            const maxNo = parsedRows.length > 0 ? Math.max(...parsedRows.map(item => item.no)) : latestNo;
+            const newRows = parsedRows.filter(item => item.no > latestNo);
+            if (newRows.length > 0) latestNo = Math.max(...newRows.map(i => i.no));
+            const minNo = Math.max(0, latestNo - SAFETY_WINDOW);
+            const candidateRows = parsedRows.filter(item => item.no > minNo && item.no <= maxNo);
+            if (CONFIG.DEBUG) {
+                const rowCount = doc.querySelectorAll('.gall_list .ub-content').length;
+                debugLog(`rowCount=${rowCount} listRows=${listRows.length}`);
+                debugLog(`newRows=${newRows.length}`);
+                debugLog(`safetyRows=${candidateRows.length}`);
+            }
+
+            const uniq = new Map();
+            candidateRows.forEach(item => {
+                if (!uniq.has(item.no)) uniq.set(item.no, item);
+            });
+            const queue = Array.from(uniq.values());
+
+            const durations = [];
+            const workerCount = Math.min(CONFIG.MAX_CONCURRENCY, queue.length || 1);
+            const workers = Array.from({ length: workerCount }, async () => {
+                while (queue.length > 0) {
+                    if (!canScanNow()) {
+                        queue.length = 0;
+                        break;
+                    }
+                    const item = queue.shift();
+                    if (!item) break;
+                    await wait(CONFIG.REQUEST_DELAY + Math.random() * CONFIG.REQUEST_JITTER);
+                    const start = performance.now();
+                    await checkPost(item.no, item.url, rules, item.title);
+                    durations.push(performance.now() - start);
+                }
+            });
+
+            await Promise.all(workers);
+            if (durations.length > 0) {
+                const avg = durations.reduce((sum, val) => sum + val, 0) / durations.length;
+                debugLog(`checkPost avg ${Math.round(avg)}ms (${durations.length})`);
+            }
+            recordSuccess();
+            if (CONFIG.DEBUG) {
+                debugLog('scanNewPosts end');
+            }
+        } catch (e) {
+            recordFailure('scanNewPosts');
+        } finally {
+            isScanning = false;
+        }
+    }
+
+    async function checkPost(no, url, rules, title) {
+        try {
+            if (CONFIG.DEBUG) {
+                debugLog(`checkPost enter no=${no} url=${url}`);
+            }
+            const postHtml = await safeFetchHTML(url, CONFIG.REQUEST_TIMEOUT);
+            const doc = new DOMParser().parseFromString(postHtml, 'text/html');
+            const content = extractCleanContent(doc);
+            const lowerContent = content.toLowerCase();
+            if (rules.exclude.some(x => lowerContent.includes(x))) return;
+            const matches = rules.include.filter(k => lowerContent.includes(k));
+            const matchCount = matches.length;
+            if (CONFIG.DEBUG) {
+                debugLog(`contentLength=${content.length}`);
+                debugLog(`matches=${matches.join(',')}`);
+            }
+            if (matchCount > 0) {
+                const minMatchCount = normalizeMinMatchCount(keywordData?.minMatchCount);
+                if (matchCount < minMatchCount) return;
+                const channels = normalizeNotifyChannels(keywordData?.notifyChannels || {}, keywordData?.webhookConfig);
+                const browserAllowed = channels.browser;
+                const webhookAllowed = channels.webhook;
+                const { authorNick, authorKey } = extractAuthorInfo(doc);
+                if (CONFIG.DEBUG) {
+                    debugLog(`authorInfo=${JSON.stringify({ authorNick, authorKey })}`);
+                }
+                const isAnonymous = isIpAuthor(authorNick, authorKey, doc);
+                if (isAnonymous && shouldIgnoreAnonymousAuthors()) return;
+                const matchedKeywords = matches.join(',');
+                const normalizedKw = canonicalKw(matchedKeywords);
+                const snippet = createContentSnippet(content);
+                const highlightedSnippet = highlightMatchedKeywords(snippet, matchedKeywords);
+                CacheSystem.set(no, matchedKeywords, snippet, authorNick, authorKey);
+                insertPreviewForCurrentRow(no, matchedKeywords, snippet);
+                if (browserAllowed || webhookAllowed) {
+                if (!shouldNotifyDedup(no, normalizedKw)) return;
+                    markNotified(no, normalizedKw);
+                    notify(matchedKeywords, title, url, highlightedSnippet, authorNick, authorKey, {
+                        browserAllowed,
+                        webhookAllowed,
+                    });
+                }
+                scheduleRestore();
+            }
+        } catch (e) {
+            recordFailure('checkPost');
+        }
+    }
+
+    function notify(kw, title, url, snippet, authorNick, authorKey, options) {
+        const webhookConfig = keywordData?.webhookConfig || getDefaultWebhookConfig();
+        const browserAllowed = options?.browserAllowed !== false;
+        const webhookAllowed = options?.webhookAllowed !== false;
+        if (browserAllowed && webhookConfig.gmNotificationEnabled !== false && typeof GM_notification === 'function') {
+            const authorDisplay = formatAuthor(authorNick, authorKey);
+            GM_notification({
+                title: `🔔 발견: ${kw}`,
+                text: `${title}\n작성자: ${authorDisplay}`,
+                timeout: 10000,
+                onclick: () => window.open(url, '_blank')
+            });
+        }
+        if (webhookAllowed && webhookConfig.enabled && webhookConfig.url) {
+            const keywordList = kw.split(',').map(item => item.trim()).filter(Boolean);
+            const keywordLabel = keywordList.join(', ');
+            const discordTitleBase = title || '새 게시글 감지';
+            const discordTitle = keywordLabel ? `${discordTitleBase} [${keywordLabel}]` : discordTitleBase;
+            const discordSnippet = createContentSnippet((snippet || '').replace(/\[(.*?)\]/g, '**$1**'));
+            sendDiscordWebhook({
+                title: discordTitle,
+                url,
+                snippet: discordSnippet,
+                authorNick,
+                authorKey,
+                detectedLocation: '본문',
+            });
+        }
+    }
+
+    function sendDiscordWebhook(payload) {
+        try {
+            if (typeof GM_xmlhttpRequest !== 'function') return;
+            const authorDisplay = formatAuthor(payload.authorNick, payload.authorKey);
+            const footerText = `감지: ${payload.detectedLocation || '본문'} · 작성자: ${authorDisplay}`;
+            const embed = {
+                title: payload.title || '새 게시글 감지',
+                description: (payload.snippet || '').slice(0, 1200),
+                url: payload.url,
+                footer: { text: footerText },
+            };
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: keywordData.webhookConfig.url,
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ embeds: [embed] }),
+                onload: () => {},
+                onerror: (err) => {
+                    console.log('[DC-Radar] Discord webhook failed', err);
+                }
+            });
+        } catch (err) {
+            console.log('[DC-Radar] Discord webhook error', err);
+
+        }
+    }
+
+    allowedHeaders = loadAllowedHeaders();
+    allowedHeadersEnabled = loadAllowedHeadersEnabled();
+    lastWasViewPage = isViewPage();
+    initUI();
+})();
